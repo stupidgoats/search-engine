@@ -1,10 +1,13 @@
 # Copyright 2013 Akretion (http://www.akretion.com)
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
 
+import json
+import logging
+
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError
 
-from odoo.addons.queue_job.job import job
+_logger = logging.getLogger(__name__)
 
 
 class SeBinding(models.AbstractModel):
@@ -28,6 +31,7 @@ class SeBinding(models.AbstractModel):
             ("to_update", "To update"),
             ("scheduled", "Scheduled"),
             ("done", "Done"),
+            ("to_be_checked", "To be checked"),
         ],
         default="new",
         readonly=True,
@@ -35,7 +39,16 @@ class SeBinding(models.AbstractModel):
     date_modified = fields.Date(readonly=True)
     date_syncronized = fields.Date(readonly=True)
     data = fields.Serialized()
+    data_display = fields.Text(
+        compute="_compute_data_display",
+        help="Include this in debug mode to be able to inspect index data.",
+    )
     active = fields.Boolean(string="Active", default=True)
+
+    @api.depends("data")
+    def _compute_data_display(self):
+        for rec in self:
+            rec.data_display = json.dumps(rec.data, sort_keys=True, indent=4)
 
     def get_export_data(self):
         """Public method to retrieve export data."""
@@ -44,7 +57,7 @@ class SeBinding(models.AbstractModel):
     @api.model
     def create(self, vals):
         record = super(SeBinding, self).create(vals)
-        record._jobify_recompute_json()
+        record.jobify_recompute_json()
         return record
 
     def write(self, vals):
@@ -79,8 +92,7 @@ class SeBinding(models.AbstractModel):
                 )
         return super(SeBinding, self).unlink()
 
-    @job(default_channel="root.search_engine.recompute_json")
-    def _jobify_recompute_json(self, force_export=False):
+    def jobify_recompute_json(self, force_export=False):
         description = _("Recompute %s json and check if need update" % self._name)
         # The job creation with tracking is very costly. So disable it.
         for record in self.with_context(tracking_disable=True):
@@ -104,31 +116,58 @@ class SeBinding(models.AbstractModel):
                     yield work
 
     # TODO maybe we need to add lock (todo check)
-    @job(default_channel="root.search_engine.recompute_json")
     def recompute_json(self, force_export=False):
-        for work in self._work_by_index():
+        """Compute index record data as JSON."""
+        # `sudo` because the recomputation can be triggered from everywhere
+        # (eg: an update of a product in the stock) and is not granted
+        # that the user triggering it has access to all required records
+        # (eg: se.backend or related records needed to compute index values).
+        # All in all, this is safe because the index data should always
+        # be the same no matter the access rights of the user triggering this.
+        result = []
+        validation_errors = []
+        to_be_checked = []
+        for work in self.sudo()._work_by_index():
             mapper = work.component(usage="se.export.mapper")
             lang = work.index.lang_id.code
-            for record in work.records.with_context(lang=lang):
-                data = mapper.map_record(record).values()
-                if record.data != data or force_export:
-                    vals = {"data": data}
-                    if record.sync_state in ("done", "new"):
+            for binding in work.records.with_context(lang=lang):
+                index_record = mapper.map_record(binding).values()
+                # Validate data and track items to check
+                error = self._validate_record(work, index_record)
+                if error:
+                    msg = "{}: {}".format(str(binding), error)
+                    _logger.error(msg)
+                    validation_errors.append(msg)
+                    to_be_checked.append(binding.id)
+                    # skip record
+                    continue
+                if binding.data != index_record or force_export:
+                    vals = {"data": index_record}
+                    if binding.sync_state != "to_update":
                         vals["sync_state"] = "to_update"
-                    record.write(vals)
+                    binding.write(vals)
+        if validation_errors:
+            result.append(_("Validation errors") + "\n" + "\n".join(validation_errors))
+        if to_be_checked:
+            self.browse(to_be_checked).write({"sync_state": "to_be_checked"})
+        return "\n\n".join(result)
 
-    @job(default_channel="root.search_engine")
+    def _validate_record(self, work, index_record):
+        return work.collection._validate_record(index_record)
+
     def synchronize(self):
-        # We volontary to the export and delete in the same transaction
+        # We volontary do the export and delete in the same transaction
         # we try first to process it into two different process but the code
-        # was more complexe and it was harder to catch/understand
-        # active/unactive case for exemple
-        # 1: some body bind a product and an export job is created
-        # 2: the binding is unactivated
-        # 3: when the job run we must exclude all inactive binding
-        # So in both export/delete we have to refilter all binding
+        # was more complex and it was harder to catch/understand
+        # active/inactive case for example:
+        #
+        # 1. some body bind a product and an export job is created
+        # 2. the binding is inactivated
+        # 3. when the job runs we must exclude all inactive binding
+        #
+        # Hence in both export/delete we have to re-filter all bindings
         # using one transaction and one sync method allow to filter only once
-        # and to to the right action as we are in an transaction
+        # and to do the right action as we are in a transaction.
         export_ids = []
         delete_ids = []
         for work in self._work_by_index():

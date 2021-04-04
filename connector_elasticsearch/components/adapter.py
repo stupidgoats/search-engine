@@ -3,8 +3,7 @@
 
 import logging
 
-from odoo import _
-from odoo.exceptions import UserError
+from odoo import exceptions
 
 from odoo.addons.component.core import Component
 
@@ -17,9 +16,15 @@ except ImportError:
     _logger.debug("Can not import elasticsearch")
 
 
+def _is_delete_nonexistent_documents(elastic_exception):
+    """True iff all errors in this exception are deleting a nonexisting document."""
+    b = lambda d: "delete" in d and d["delete"]["status"] == 404  # noqa
+    return all(b(error) for error in elastic_exception.errors)
+
+
 class ElasticsearchAdapter(Component):
     _name = "elasticsearch.adapter"
-    _inherit = ["base.backend.adapter", "elasticsearch.se.connector"]
+    _inherit = ["se.backend.adapter", "elasticsearch.se.connector"]
     _usage = "se.backend.adapter"
 
     @property
@@ -33,8 +38,13 @@ class ElasticsearchAdapter(Component):
     def _get_es_client(self):
         backend = self.backend_record
 
+        api_key = None
+        if backend.api_key_id and backend.api_key:
+            api_key = (backend.api_key_id, backend.api_key)
         es = elasticsearch.Elasticsearch(
-            [backend.es_server_host], connection_class=self._es_connection_class
+            [backend.es_server_host],
+            connection_class=self._es_connection_class,
+            api_key=api_key,
         )
 
         if not es.ping():  # pragma: no cover
@@ -46,43 +56,43 @@ class ElasticsearchAdapter(Component):
             )
         return es
 
-    def index(self, datas):
+    def index(self, records):
         es = self._get_es_client()
-        dataforbulk = []
-        for data in datas:
-            # Ensure that the _record_id_key is set for creating/updating
-            # the record
-            if not data.get(self._record_id_key):
-                raise UserError(
-                    _("The key %s is missing in the data %s")
-                    % (self._record_id_key, data)
-                )
-            else:
-                action = {
-                    "_index": self._index_name,
-                    "_id": data.get(self._record_id_key),
-                    "_source": data,
-                }
-                dataforbulk.append(action)
+        records_for_bulk = []
+        for record in records:
+            error = self._validate_record(record)
+            if error:
+                raise exceptions.ValidationError(error)
+            action = {
+                "_index": self._index_name,
+                "_id": record.get(self._record_id_key),
+                "_source": record,
+            }
+            records_for_bulk.append(action)
 
-        res = elasticsearch.helpers.bulk(es, dataforbulk)
-        # checks if number of indexed object and object in datas are equal
-        return len(datas) - res[0] == 0
+        res = elasticsearch.helpers.bulk(es, records_for_bulk)
+        # checks if number of indexed object and object in records are equal
+        return len(records) - res[0] == 0
 
     def delete(self, binding_ids):
         es = self._get_es_client()
-        dataforbulk = []
+        records_for_bulk = []
         for binding_id in binding_ids:
             action = {
                 "_op_type": "delete",
                 "_index": self._index_name,
                 "_id": binding_id,
             }
-            dataforbulk.append(action)
-
-        res = elasticsearch.helpers.bulk(es, dataforbulk)
-        # checks if number of indexed object and object in datas are equal
-        return len(binding_ids) - res[0] == 0
+            records_for_bulk.append(action)
+        try:
+            elasticsearch.helpers.bulk(es, records_for_bulk)
+        except elasticsearch.helpers.errors.BulkIndexError as e:
+            # if the document we are trying to delete does not exist,
+            # we can consider deletion a success (there is nothing to do).
+            if not _is_delete_nonexistent_documents(e):
+                raise e
+            msg = "Trying to delete non-existent documents. Ignored: %s"
+            _logger.info(msg, e)
 
     def clear(self):
         es = self._get_es_client()

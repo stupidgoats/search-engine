@@ -4,7 +4,7 @@
 
 {
     "name": "Connector Search Engine",
-    "version": "13.0.1.0.1",
+    "version": "13.0.2.8.0",
     "author": "Akretion,"
     "ACSONE SA/NV,"
     "Camptocamp,"
@@ -16,10 +16,15 @@
     "external_dependencies": {"python": ["unidecode"]},
     "data": [
         "security/connector_search_engine_security.xml",
+        "security/se_index_config.xml",
         "security/ir.model.access.csv",
         "views/se_backend.xml",
+        "views/se_index.xml",
+        "views/se_index_config.xml",
         "views/se_menu.xml",
         "data/ir_cron.xml",
+        "data/queue_job_channel_data.xml",
+        "data/queue_job_function_data.xml",
     ],
     "installable": True,
 }

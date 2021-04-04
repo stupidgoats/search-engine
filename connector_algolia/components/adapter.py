@@ -5,8 +5,7 @@
 
 import logging
 
-from odoo import _
-from odoo.exceptions import UserError
+from odoo import exceptions
 
 from odoo.addons.component.core import Component
 
@@ -21,7 +20,7 @@ except ImportError:  # pragma: no cover
 
 class AlgoliaAdapter(Component):
     _name = "algolia.adapter"
-    _inherit = ["base.backend.adapter", "algolia.se.connector"]
+    _inherit = ["se.backend.adapter", "algolia.se.connector"]
     _usage = "se.backend.adapter"
 
     def get_index(self):
@@ -51,14 +50,10 @@ class AlgoliaAdapter(Component):
 
     def index(self, records):
         index = self.get_index()
-        # Ensure that the objectID is set because algolia will use it
-        # for creating or updating the record
-        for data in records:
-            if not data.get(self._record_id_key):
-                raise UserError(
-                    _("The key %s is missing in the data %s")
-                    % (self._record_id_key, data)
-                )
+        for record in records:
+            error = self._validate_record(record)
+            if error:
+                raise exceptions.ValidationError(error)
         index.add_objects(records)
 
     def delete(self, binding_ids):
